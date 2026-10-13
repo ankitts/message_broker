@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <variant>
@@ -31,8 +32,19 @@ struct PublishCmd {
     std::string body;
 };
 
+struct ConsumeCmd {
+    std::string queue;
+};
+
+// Tags are per queue, so an ACK must name the queue too.
+struct AckCmd {
+    std::string queue;
+    uint64_t tag;
+};
+
 // One parsed client frame; std::visit on it to dispatch.
-using Command = std::variant<DeclareQueueCmd, DeclareExchangeCmd, BindCmd, PublishCmd>;
+using Command = std::variant<DeclareQueueCmd, DeclareExchangeCmd, BindCmd, PublishCmd,
+                             ConsumeCmd, AckCmd>;
 
 // Outcome of parsing a frame: either a Command or a human-readable error.
 struct ParseResult {

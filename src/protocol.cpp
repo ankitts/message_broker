@@ -50,6 +50,23 @@ bool requireName(const json& obj, const char* field, std::string& out, std::stri
     return true;
 }
 
+// Reads obj[field] as a non-negative integer. A string, negative number or
+// float is rejected (nlohmann stores non-negative integers as unsigned, and
+// anything beyond uint64 range as a float).
+bool requireUnsigned(const json& obj, const char* field, uint64_t& out, std::string& error) {
+    auto it = obj.find(field);
+    if (it == obj.end()) {
+        error = std::string("missing field '") + field + "'";
+        return false;
+    }
+    if (!it->is_number_unsigned()) {
+        error = std::string("field '") + field + "' must be a non-negative integer";
+        return false;
+    }
+    out = it->get<uint64_t>();
+    return true;
+}
+
 // Maps the wire text ("direct"/"fanout"/"topic") to an ExchangeType.
 // Returns false for anything else.
 bool parseExchangeType(const std::string& text, ExchangeType& out) {
@@ -103,6 +120,19 @@ ParseResult Protocol::parse(const std::string& line) {
         if (!requireName(j, "exchange", c.exchange, error))         return fail(error);
         if (!requireString(j, "routing_key", c.routing_key, error)) return fail(error);
         if (!requireString(j, "body", c.body, error))               return fail(error);
+        return ok(std::move(c));
+    }
+
+    if (cmd == "CONSUME") {
+        ConsumeCmd c;
+        if (!requireName(j, "queue", c.queue, error)) return fail(error);
+        return ok(std::move(c));
+    }
+
+    if (cmd == "ACK") {
+        AckCmd c{};
+        if (!requireName(j, "queue", c.queue, error)) return fail(error);
+        if (!requireUnsigned(j, "tag", c.tag, error)) return fail(error);
         return ok(std::move(c));
     }
 

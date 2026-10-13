@@ -188,5 +188,29 @@ int main() {
         ParseResult bad = Protocol::parse("nope");
         assert(!bad && !bad.error.empty() && !bad.command);
     }
+    {   // 17. CONSUME and ACK parse; ACK needs a non-negative integer tag
+        auto c = expect<ConsumeCmd>(R"({"cmd":"CONSUME","queue":"orders"})");
+        assert(c.queue == "orders");
+        expectError(R"({"cmd":"CONSUME"})", "missing field 'queue'");
+        expectError(R"({"cmd":"CONSUME","queue":""})", "must not be empty");
+
+        auto a = expect<AckCmd>(R"({"cmd":"ACK","queue":"orders","tag":7})");
+        assert(a.queue == "orders" && a.tag == 7);
+        assert(expect<AckCmd>(R"({"cmd":"ACK","queue":"q","tag":0})").tag == 0);
+
+        expectError(R"({"cmd":"ACK","queue":"q"})", "missing field 'tag'");
+        expectError(R"({"cmd":"ACK","tag":1})", "missing field 'queue'");
+        expectError(R"({"cmd":"ACK","queue":"q","tag":-1})", "non-negative integer");
+        expectError(R"({"cmd":"ACK","queue":"q","tag":"7"})", "non-negative integer");
+        expectError(R"({"cmd":"ACK","queue":"q","tag":7.5})", "non-negative integer");
+        expectError(R"({"cmd":"ACK","queue":"q","tag":7.0})", "non-negative integer");
+        expectError(R"({"cmd":"ACK","queue":"q","tag":null})", "non-negative integer");
+        // Above 2^63 still fits uint64, so it parses (it just won't match a delivery).
+        auto big = expect<AckCmd>(R"({"cmd":"ACK","queue":"q","tag":18446744073709551615})");
+        assert(big.tag == UINT64_MAX);
+        // 2^64 does not fit: nlohmann stores it as a float, so it is rejected.
+        expectError(R"({"cmd":"ACK","queue":"q","tag":18446744073709551616})",
+                    "non-negative integer");
+    }
     std::cout << "all protocol tests passed\n";
 }

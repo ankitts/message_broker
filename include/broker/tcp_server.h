@@ -10,7 +10,8 @@
 
 // Blocking TCP server speaking the broker protocol: one detached thread per
 // client connection. Each connection reads newline-delimited JSON commands
-// and answers every one with one JSON line.
+// and answers every one with one JSON line. A connection that consumes a
+// queue also receives DELIVER lines sent by other clients' threads.
 //
 // Lifetime notes:
 //   - client threads are detached and hold a pointer to the server, so the
@@ -41,7 +42,6 @@ public:
 private:
     void handleClient(int client_fd, std::string peer);
 
-    static bool sendAll(int fd, const char* data, size_t len);
     static std::string formatPeer(const sockaddr_in& addr);
 
     uint16_t port_;

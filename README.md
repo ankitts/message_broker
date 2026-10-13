@@ -33,7 +33,11 @@ It listens on port 8080 (set in `src/main.cpp`).
 Try it from another terminal:
 
 ```sh
-python3 tools/client.py
+# terminal 1: prints every message pushed to it
+python3 tools/consumer.py
+
+# terminal 2: publishes (try -n 5 for five messages)
+python3 tools/publisher.py hello
 ```
 
 or by hand:
@@ -75,6 +79,6 @@ To check for memory errors or data races, compile the tests by hand with `-fsani
 |---|---|
 | `include/broker/`, `src/` | The broker library and server |
 | `tests/` | Test programs (plain `assert`) |
-| `tools/client.py` | Sample client |
+| `tools/publisher.py`, `tools/consumer.py` | Sample publisher and consumer |
 
 Clean build output with `make clean`.

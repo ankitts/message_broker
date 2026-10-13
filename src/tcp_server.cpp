@@ -2,6 +2,8 @@
 
 #include <cerrno>
 #include <cstring>
+#include <chrono>
+#include <memory>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -10,6 +12,7 @@
 
 #include "broker/frame_buffer.h"
 #include "broker/logger.h"
+#include "broker/socket_connection.h"
 
 TcpServer::TcpServer(CommandHandler& cmd_handler, uint16_t port, int backlog)
     : port_(port), backlog_(backlog), m_cmd_handler(cmd_handler) {}
@@ -66,13 +69,22 @@ void TcpServer::run() {
                                reinterpret_cast<sockaddr*>(&client_address),
                                &client_len);
         if (client_fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == ECONNABORTED) continue;
             Logger::log(std::string("accept: ") + std::strerror(errno));
+            // EMFILE/ENFILE/ENOBUFS persist until something closes: back off
+            // instead of spinning at 100% CPU and flooding the log.
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
 
         std::string peer = formatPeer(client_address);
-        std::thread(&TcpServer::handleClient, this, client_fd, std::move(peer)).detach();
+        try {
+            std::thread(&TcpServer::handleClient, this, client_fd, std::move(peer)).detach();
+        } catch (const std::system_error& e) {
+            // Could not start a thread: nobody owns the fd, so close it here.
+            Logger::log(std::string("thread: ") + e.what());
+            close(client_fd);
+        }
     }
 }
 
@@ -80,11 +92,15 @@ void TcpServer::handleClient(int client_fd, std::string peer) {
     int count = active_connections_.fetch_add(1) + 1;
     Logger::log("connected " + peer + " (" + std::to_string(count) + " active)");
 
+    // The connection owns the fd and closes it in its destructor, i.e. when
+    // the LAST shared_ptr goes away. Another thread (a publisher pushing a
+    // DELIVER to this client) may still hold one after this function ends;
+    // closing the fd here would let the OS reuse its number for a new client
+    // and that publisher would write to the wrong person.
+    auto conn = std::make_shared<SocketConnection>(client_fd);
+
     // Each connection has its own FrameBuffer: it turns the byte stream into
     // whole lines, however the bytes were split across reads.
-    static const std::string kTooLong =
-        "{\"type\":\"ERROR\",\"reason\":\"line too long\"}\n";
-
     FrameBuffer frames;
     char buffer[4096];
     bool open = true;
@@ -93,7 +109,9 @@ void TcpServer::handleClient(int client_fd, std::string peer) {
         if (n == 0) break;  // peer closed cleanly
         if (n < 0) {
             if (errno == EINTR) continue;
-            Logger::log("read error from " + peer + ": " + std::strerror(errno));
+            if (!conn->closed()) {
+                Logger::log("read error from " + peer + ": " + std::strerror(errno));
+            }
             break;
         }
 
@@ -102,12 +120,19 @@ void TcpServer::handleClient(int client_fd, std::string peer) {
         // Answer every complete line, in order. No lock is held here: the
         // handler has already released its lock when it returns.
         while (auto frame = frames.nextFrame()) {
-            std::string reply = m_cmd_handler.handleLine(*frame);
-            reply += '\n';
-            if (!sendAll(client_fd, reply.data(), reply.size())) {
-                Logger::log("send error to " + peer + ": " + std::strerror(errno));
+            Result result = m_cmd_handler.handleLine(*frame, conn);
+
+            // Reply first, then pushes: this is what puts the OK for CONSUME
+            // ahead of the DELIVERs it caused.
+            if (!conn->send(result.reply)) {
+                Logger::log("send error to " + peer);
                 open = false;
                 break;
+            }
+            for (const Push& push : result.pushes) {
+                // A failed push is that consumer's problem; its own thread
+                // notices and cleans up (send() shuts the socket down).
+                push.to->send(push.line);
             }
         }
 
@@ -115,28 +140,16 @@ void TcpServer::handleClient(int client_fd, std::string peer) {
         // trusted any more: say so once, then hang up. (Complete lines before
         // it were already answered above.)
         if (open && !within_limit) {
-            sendAll(client_fd, kTooLong.data(), kTooLong.size());
+            conn->send("{\"type\":\"ERROR\",\"reason\":\"line too long\"}");
             Logger::log("line too long from " + peer + ", closing");
             open = false;
         }
     }
 
-    close(client_fd);
+    m_cmd_handler.onDisconnect(conn);
+    conn.reset();   // closes the fd now unless a publisher still holds a reference
     count = active_connections_.fetch_sub(1) - 1;
     Logger::log("disconnected " + peer + " (" + std::to_string(count) + " active)");
-}
-
-bool TcpServer::sendAll(int fd, const char* data, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, data + sent, len - sent, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        sent += static_cast<size_t>(n);
-    }
-    return true;
 }
 
 std::string TcpServer::formatPeer(const sockaddr_in& addr) {

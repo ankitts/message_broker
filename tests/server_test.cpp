@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <set>
@@ -92,10 +93,22 @@ static json pub(const std::string& e, const std::string& k, const std::string& b
     return {{"cmd", "PUBLISH"}, {"exchange", e}, {"routing_key", k}, {"body", body}};
 }
 
+static json consumeCmd(const std::string& q) { return {{"cmd", "CONSUME"}, {"queue", q}}; }
+static json ackCmd(const std::string& q, uint64_t tag) {
+    return {{"cmd", "ACK"}, {"queue", q}, {"tag", tag}};
+}
+
+// Peeks at broker state. The broker has no lock of its own, so only call
+// this when no command is in flight on the queue being inspected.
+static Broker* g_broker = nullptr;
+static size_t broker_unacked(const std::string& q) { return g_broker->getQueue(q)->unackedCount(); }
+static size_t broker_ready(const std::string& q) { return g_broker->getQueue(q)->readyCount(); }
+
 int main() {
     // Static so they outlive the detached server thread, which blocks in
     // accept() forever; the process just exits when main returns.
     static Broker broker;
+    g_broker = &broker;
     static CommandHandler handler(broker);
     static TcpServer server(handler, 0);   // port 0: the OS picks a free one
     bool started = server.start();
@@ -182,6 +195,101 @@ int main() {
         assert(all.size() == static_cast<size_t>(kClients * kMsgs));
     }
 
+    {   // 7. one socket consumes while another publishes; the DELIVER arrives
+        Client setup(port);
+        assert(setup.call(declEx("ex7"))["type"] == "OK");
+        assert(setup.call(declQ("q7"))["type"] == "OK");
+        assert(setup.call(bindCmd("ex7", "q7", "k"))["type"] == "OK");
+
+        Client consumer(port);
+        assert(consumer.call(consumeCmd("q7"))["type"] == "OK");
+        json r = setup.call(pub("ex7", "k", "hello"));
+        assert(r["type"] == "OK" && r["routed"] == 1);
+
+        json d = consumer.expectReply();
+        assert(d["type"] == "DELIVER" && d["queue"] == "q7" && d["body"] == "hello");
+        assert(d["routing_key"] == "k" && d["id"] == r["id"] && d["tag"] == 1);
+        assert(consumer.call(ackCmd("q7", d["tag"].get<uint64_t>()))["type"] == "OK");
+        assert(broker_unacked("q7") == 0);
+    }
+    {   // 8. one client consumes and publishes on the same socket; backlog comes after OK
+        Client c(port);
+        assert(c.call(declEx("ex8"))["type"] == "OK");
+        assert(c.call(declQ("q8"))["type"] == "OK");
+        assert(c.call(bindCmd("ex8", "q8", "k"))["type"] == "OK");
+        assert(c.call(pub("ex8", "k", "backlog"))["type"] == "OK");
+
+        c.send(consumeCmd("q8").dump() + "\n");
+        assert(c.expectReply()["type"] == "OK");            // OK first...
+        assert(c.expectReply()["body"] == "backlog");       // ...then the DELIVER
+
+        // Publishing to itself: reply goes first, then the DELIVER.
+        c.send(pub("ex8", "k", "self").dump() + "\n");
+        json reply = c.expectReply();
+        assert(reply["type"] == "OK" && reply["routed"] == 1);
+        json d = c.expectReply();
+        assert(d["type"] == "DELIVER" && d["body"] == "self");
+    }
+    {   // 9. four threads hammer one consumer socket: every line is valid JSON
+        constexpr int kPublishers = 4, kMsgs = 200;
+        Client consumer(port), setup(port);
+        assert(setup.call(declEx("ex9"))["type"] == "OK");
+        assert(setup.call(declQ("q9"))["type"] == "OK");
+        assert(setup.call(bindCmd("ex9", "q9", "k"))["type"] == "OK");
+        assert(consumer.call(consumeCmd("q9"))["type"] == "OK");
+
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kPublishers; ++t) {
+            threads.emplace_back([&] {
+                Client c(port);
+                for (int i = 0; i < kMsgs; ++i) {
+                    // a long-ish body makes torn writes more likely to show
+                    assert(c.call(pub("ex9", "k", std::string(2000, 'z')))["type"] == "OK");
+                }
+            });
+        }
+        std::set<uint64_t> ids;
+        for (int i = 0; i < kPublishers * kMsgs; ++i) {
+            json d = consumer.expectReply();             // asserts it parses
+            assert(d["type"] == "DELIVER" && d["body"].get<std::string>().size() == 2000);
+            ids.insert(d["id"].get<uint64_t>());
+        }
+        for (auto& th : threads) th.join();
+        assert(ids.size() == static_cast<size_t>(kPublishers * kMsgs));
+    }
+    {   // 10. a consumer vanishes mid-stream: publishers keep working, server survives
+        Client setup(port);
+        assert(setup.call(declEx("ex10"))["type"] == "OK");
+        assert(setup.call(declQ("q10"))["type"] == "OK");
+        assert(setup.call(bindCmd("ex10", "q10", "k"))["type"] == "OK");
+        {
+            Client consumer(port);
+            assert(consumer.call(consumeCmd("q10"))["type"] == "OK");
+            for (int i = 0; i < 20; ++i) assert(setup.call(pub("ex10", "k"))["type"] == "OK");
+            // consumer destroyed here without reading or acking
+        }
+        for (int i = 0; i < 200; ++i) assert(setup.call(pub("ex10", "k"))["type"] == "OK");
+        // Once the server noticed the disconnect, nothing is delivered and the
+        // rest stays ready. Wait for the registry to drop the dead consumer.
+        for (int i = 0; i < 100 && broker_ready("q10") == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        assert(broker_ready("q10") > 0);
+        Client again(port);
+        assert(again.call(declQ("still_alive"))["type"] == "OK");
+    }
+
+    // The statics above are destroyed when main returns; first let every
+    // detached client thread finish its disconnect handling.
+    for (int i = 0; i < 200 && server.activeConnections() > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(server.activeConnections() == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));   // trailing log line
+
     Logger::log("all server tests passed");   // not cout: server threads log concurrently
-    return 0;
+    // The accept thread blocks forever and wakes with an error as soon as the
+    // static server closes its fd during exit, then touches destroyed statics.
+    // There is no server shutdown API yet, so skip static destruction.
+    std::_Exit(0);
 }
